@@ -1,0 +1,89 @@
+name: Site audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Website to audit (e.g. example.com)
+        required: true
+      lighthouse:
+        description: Lighthouse pages (all, a number, or 0 for off)
+        default: all
+      device:
+        description: Lighthouse form factor
+        type: choice
+        options: [mobile, desktop]
+        default: mobile
+      max_pages:
+        description: Max pages to crawl
+        default: '500'
+      concurrency:
+        description: Parallel browser pages (lower it if the site throttles)
+        default: '4'
+
+permissions:
+  contents: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      name: ${{ steps.run.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci # postinstall downloads Playwright Chromium
+      - run: npx playwright install-deps chromium
+      - id: run
+        name: Run audit
+        env:
+          URL: ${{ inputs.url }}
+          WAVE_API_KEY: ${{ secrets.WAVE_API_KEY }} # optional repo secret
+        run: |
+          HOST=$(node -e 'const u=process.argv[1]; console.log(new URL(/^https?:/.test(u)?u:"https://"+u).hostname)' "$URL")
+          NAME="$HOST-$(date -u +%Y-%m-%d-%H%M)"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          node audit.mjs "$URL" --out "out/$NAME" \
+            --lighthouse "${{ inputs.lighthouse }}" --device "${{ inputs.device }}" \
+            --max-pages "${{ inputs.max_pages }}" --concurrency "${{ inputs.concurrency }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.run.outputs.name }}
+          path: out/${{ steps.run.outputs.name }}
+          retention-days: 30
+
+  publish:
+    needs: audit
+    runs-on: ubuntu-latest
+    concurrency: publish-pages # one gh-pages push at a time; audits still run in parallel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        continue-on-error: true # first run: branch doesn't exist yet
+        with:
+          ref: gh-pages
+          path: pages
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.audit.outputs.name }}
+          path: pages/reports/${{ needs.audit.outputs.name }}
+      - name: Build index and push gh-pages
+        run: |
+          node build-index.mjs pages 30
+          cd pages
+          rm -rf .git && touch .nojekyll
+          # single orphan commit: keeps the branch from growing with every run's Lighthouse files
+          git init -q -b gh-pages
+          git add -A
+          git -c user.name=github-actions -c user.email=github-actions@users.noreply.github.com commit -qm "Report ${{ needs.audit.outputs.name }}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" gh-pages
+      - name: Summary
+        run: |
+          BASE="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          echo "### Report: $BASE/reports/${{ needs.audit.outputs.name }}/report.html" >> "$GITHUB_STEP_SUMMARY"
+          echo "All reports: $BASE/" >> "$GITHUB_STEP_SUMMARY"
+          echo "(Pages can take ~1 min to update.)" >> "$GITHUB_STEP_SUMMARY"
